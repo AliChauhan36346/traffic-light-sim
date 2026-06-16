@@ -8,6 +8,21 @@ const LANE_COLORS = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b"];
 const STATUS_COLORS = { healthy: "#10b981", degraded: "#d97706", critical: "#ef4444" };
 const SIGNAL_COLORS = { green: "#10b981", yellow: "#facc15", red: "#ef4444" };
 
+function average(values) {
+  if (!values.length) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function getModeStats(history, mode) {
+  const samples = history.filter((entry) => entry.controller_mode === mode);
+  return {
+    samples: samples.length,
+    avgWait: average(samples.map((entry) => Number(entry.avg_wait))).toFixed(1),
+    avgQueue: average(samples.map((entry) => Number(entry.total_queue))).toFixed(1),
+    avgVehicles: average(samples.map((entry) => Number(entry.total_vehicles))).toFixed(1),
+  };
+}
+
 export default function Dashboard({ apiBase, health, sim, error }) {
   const [history, setHistory] = useState([]);
 
@@ -15,10 +30,14 @@ export default function Dashboard({ apiBase, health, sim, error }) {
     if (!sim) return;
 
     setHistory((prev) => {
+      const totalQueue = sim.lanes
+        ? sim.lanes.reduce((a, l) => a + l.queue_length, 0)
+        : 0;
       const next = [
         ...prev,
         {
           time: new Date().toLocaleTimeString(),
+          controller_mode: sim.config?.controller_mode ?? sim.prediction?.controller ?? "smart",
           ...Object.fromEntries(
             (sim.lanes ?? []).map((l) => [`lane_${l.lane_id}_queue`, l.queue_length])
           ),
@@ -26,12 +45,13 @@ export default function Dashboard({ apiBase, health, sim, error }) {
             ? (sim.lanes.reduce((a, l) => a + l.waiting_time, 0) /
                 Math.max(sim.lanes.length, 1)).toFixed(1)
             : 0,
+          total_queue: totalQueue.toFixed(1),
           total_vehicles: sim.lanes
             ? sim.lanes.reduce((a, l) => a + l.vehicle_count, 0)
             : 0,
         },
       ];
-      return next.slice(-30);
+      return next.slice(-120);
     });
   }, [sim]);
 
@@ -50,6 +70,9 @@ export default function Dashboard({ apiBase, health, sim, error }) {
     ? (lanes.reduce((a, l) => a + l.waiting_time, 0) / lanes.length).toFixed(1)
     : 0;
   const greenLanes = lanes.filter((l) => l.is_green).length;
+  const smartStats = getModeStats(history, "smart");
+  const fixedStats = getModeStats(history, "fixed");
+  const activeMode = sim?.config?.controller_mode ?? "smart";
 
   const status = health?.model_loaded ? "healthy" : totalVehicles > 30 ? "critical" : "degraded";
 
@@ -86,6 +109,19 @@ export default function Dashboard({ apiBase, health, sim, error }) {
         />
       </div>
 
+      <div style={styles.compareGrid}>
+        <CompareCard
+          title="Smart ML-Assisted"
+          active={activeMode === "smart"}
+          stats={smartStats}
+        />
+        <CompareCard
+          title="No-ML Fixed Cycle"
+          active={activeMode === "fixed"}
+          stats={fixedStats}
+        />
+      </div>
+
       {/* Queue & Wait Chart */}
       <div style={styles.chartRow}>
         <div style={styles.chartCard}>
@@ -114,7 +150,7 @@ export default function Dashboard({ apiBase, health, sim, error }) {
         <div style={styles.chartCard}>
           <h3 style={styles.chartTitle}>Traffic History (last 30 samples)</h3>
           <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={history}>
+            <LineChart data={history.slice(-30)}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
               <XAxis dataKey="time" stroke="#6b7280" tick={{ fill: "#6b7280", fontSize: 9 }} interval="preserveStartEnd" />
               <YAxis stroke="#6b7280" tick={{ fill: "#6b7280", fontSize: 11 }} />
@@ -164,6 +200,7 @@ export default function Dashboard({ apiBase, health, sim, error }) {
                 <th style={styles.th}>Direction</th>
                 <th style={styles.th}>Queue</th>
                 <th style={styles.th}>Wait (s)</th>
+                <th style={styles.th}>Countdown</th>
                 <th style={styles.th}>Vehicles</th>
                 <th style={styles.th}>Speed (km/h)</th>
                 <th style={styles.th}>Phase</th>
@@ -185,6 +222,7 @@ export default function Dashboard({ apiBase, health, sim, error }) {
                     <td style={styles.td}>{l.direction}</td>
                     <td style={styles.td}>{l.queue_length.toFixed(1)}</td>
                     <td style={styles.td}>{l.waiting_time.toFixed(1)}</td>
+                    <td style={styles.td}>{l.signal_countdown ?? 0}s</td>
                     <td style={styles.td}>{l.vehicle_count}</td>
                     <td style={styles.td}>{l.avg_speed.toFixed(1)}</td>
                     <td style={styles.td}>
@@ -223,6 +261,21 @@ function Card({ label, value, color, sub }) {
       <div style={{ ...styles.cardValue, color: color || "#1f2937" }}>{value}</div>
       <div style={styles.cardLabel}>{label}</div>
       {sub && <div style={styles.cardSub}>{sub}</div>}
+    </div>
+  );
+}
+
+function CompareCard({ title, active, stats }) {
+  return (
+    <div style={{ ...styles.compareCard, ...(active ? styles.compareCardActive : {}) }}>
+      <div style={styles.compareTitle}>{title}</div>
+      <div style={styles.compareStatus}>{active ? "Running now" : "Stored samples"}</div>
+      <div style={styles.compareMetrics}>
+        <span>Avg Wait: {stats.samples ? `${stats.avgWait}s` : "N/A"}</span>
+        <span>Avg Queue: {stats.samples ? stats.avgQueue : "N/A"}</span>
+        <span>Vehicles: {stats.samples ? stats.avgVehicles : "N/A"}</span>
+      </div>
+      <div style={styles.compareSamples}>{stats.samples} samples</div>
     </div>
   );
 }
@@ -279,6 +332,48 @@ const styles = {
     color: "#6b7280",
     fontWeight: 500,
     marginTop: 6,
+  },
+  compareGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+    gap: 14,
+  },
+  compareCard: {
+    background: "rgba(255, 255, 255, 0.75)",
+    borderRadius: 12,
+    padding: "14px 16px",
+    border: "1px solid rgba(209, 213, 219, 0.8)",
+    boxShadow: "0 8px 32px 0 rgba(31, 38, 135, 0.04)",
+  },
+  compareCardActive: {
+    border: "2px solid #10b981",
+  },
+  compareTitle: {
+    fontSize: "0.95rem",
+    fontWeight: 800,
+    color: "#1f2937",
+  },
+  compareStatus: {
+    marginTop: 2,
+    color: "#6b7280",
+    fontSize: "0.75rem",
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: "0.5px",
+  },
+  compareMetrics: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    marginTop: 10,
+    fontSize: "0.82rem",
+    fontWeight: 700,
+    color: "#374151",
+  },
+  compareSamples: {
+    marginTop: 8,
+    fontSize: "0.75rem",
+    color: "#6b7280",
   },
   chartRow: {
     display: "grid",

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import axios from "axios";
 import Dashboard from "./components/Dashboard";
 import TrafficScene3D from "./components/TrafficScene3D";
@@ -12,12 +12,15 @@ export default function App() {
   const [arrivalRates, setArrivalRates] = useState([0.25, 0.25, 0.25, 0.25]);
   const [controllerMode, setControllerMode] = useState("smart");
   const [configMessage, setConfigMessage] = useState("");
+  const measuredCountsRef = useRef([4, 4, 4, 4]);
 
   const fetchSimulation = useCallback(async () => {
     try {
       const [healthRes, simRes] = await Promise.all([
         axios.get(`${API_BASE}/health`),
-        axios.get(`${API_BASE}/simulation/current`),
+        axios.post(`${API_BASE}/simulation/current`, {
+          measured_counts: measuredCountsRef.current,
+        }),
       ]);
 
       setHealth(healthRes.data);
@@ -28,9 +31,13 @@ export default function App() {
     }
   }, []);
 
+  const handleMeasuredCountsChange = useCallback((counts) => {
+    measuredCountsRef.current = counts;
+  }, []);
+
   useEffect(() => {
     fetchSimulation();
-    const interval = setInterval(fetchSimulation, 2000);
+    const interval = setInterval(fetchSimulation, 1000);
     return () => clearInterval(interval);
   }, [fetchSimulation]);
 
@@ -85,7 +92,12 @@ export default function App() {
         onModeChange={(mode) => applyConfig(mode)}
       />
       <main style={styles.main}>
-        <TrafficScene3D simData={simData} error={apiError} />
+        <TrafficScene3D
+          simData={simData}
+          error={apiError}
+          arrivalRates={arrivalRates}
+          onMeasuredCountsChange={handleMeasuredCountsChange}
+        />
         <Dashboard apiBase={API_BASE} health={health} sim={simData} error={apiError} />
       </main>
     </div>

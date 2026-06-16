@@ -1,4 +1,4 @@
-import React, { useRef, useMemo } from "react";
+import React, { useRef, useMemo, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { OrbitControls, Html } from "@react-three/drei";
 import * as THREE from "three";
@@ -191,7 +191,7 @@ function RoadLabel({ position, label }) {
   );
 }
 
-function TrafficLight({ position, rotationY, signalState, queueLength, waitingTime, armLength = 1.2 }) {
+function TrafficLight({ position, rotationY, signalState, queueLength, countdown, armLength = 1.2 }) {
   const poleHeight = 3.2;
   const armHeight = 3.0;
   const absArmLength = Math.abs(armLength);
@@ -313,7 +313,7 @@ function TrafficLight({ position, rotationY, signalState, queueLength, waitingTi
           <br />
           Q: {queueLength}
           <br />
-          W: {waitingTime.toFixed(0)}s
+          T: {countdown ?? 0}s
         </div>
       </Html>
     </group>
@@ -321,9 +321,23 @@ function TrafficLight({ position, rotationY, signalState, queueLength, waitingTi
 }
 
 const TURN_OPTIONS = ["straight", "straight", "left", "right"];
+const ROAD_SPAWN_PROGRESS = -14.0;
+const ROAD_EXIT_PROGRESS = 20.0;
+const CAR_SPACING = 2.8;
 
 function chooseRandomTurn() {
   return TURN_OPTIONS[Math.floor(Math.random() * TURN_OPTIONS.length)];
+}
+
+function createSimCar(laneIdx, carIdx, carColors, progress = ROAD_SPAWN_PROGRESS - carIdx * CAR_SPACING) {
+  return {
+    id: `${laneIdx}-${carIdx}-${Math.random().toString(36).slice(2)}`,
+    progress,
+    speed: 0.0,
+    maxSpeed: 0.035 + Math.random() * 0.02,
+    color: carColors[(laneIdx * 7 + carIdx) % carColors.length],
+    route: chooseRandomTurn(),
+  };
 }
 
 function getDirectionForRoute(laneIdx, route) {
@@ -390,7 +404,11 @@ function Car({ laneIdx, carIdx, carsRef }) {
   useFrame(() => {
     if (!meshRef.current || !carsRef.current) return;
     const car = carsRef.current[laneIdx][carIdx];
-    if (!car) return;
+    if (!car) {
+      meshRef.current.visible = false;
+      return;
+    }
+    meshRef.current.visible = true;
     const transform = getCarTransform(laneIdx, car.route ?? "straight", car.progress);
     meshRef.current.position.set(...transform.position);
     meshRef.current.rotation.set(0, transform.rotationY, 0);
@@ -469,7 +487,7 @@ function Car({ laneIdx, carIdx, carsRef }) {
 /* ------------------------------------------------------------------ */
 /* 3D Scene Container                                                  */
 /* ------------------------------------------------------------------ */
-export default function TrafficScene3D({ simData, error }) {
+export default function TrafficScene3D({ simData, error, arrivalRates, onMeasuredCountsChange }) {
   const lanes = simData?.lanes ?? [];
 
   // Color pool for car randomization
@@ -481,16 +499,11 @@ export default function TrafficScene3D({ simData, error }) {
   // Initialize stateful cars in a ref for fast, lag-free physics updates inside useFrame
   const carsRef = useRef(
     Array.from({ length: 4 }).map((_, laneIdx) =>
-      Array.from({ length: 4 }).map((_, carIdx) => ({
-        id: `${laneIdx}-${carIdx}`,
-        progress: -3.0 - carIdx * 4.0, // space them out initially
-        speed: 0.0,
-        maxSpeed: 0.07 + Math.random() * 0.04,
-        color: carColors[(laneIdx * 4 + carIdx) % carColors.length],
-        route: chooseRandomTurn(),
-      }))
+      Array.from({ length: 4 }).map((_, carIdx) => createSimCar(laneIdx, carIdx, carColors))
     )
   );
+  const spawnAccumulatorsRef = useRef([0, 0, 0, 0]);
+  const [visibleCarCounts, setVisibleCarCounts] = useState([4, 4, 4, 4]);
 
   return (
     <div style={styles.container}>
@@ -538,7 +551,7 @@ export default function TrafficScene3D({ simData, error }) {
                 armLength={poleConfig[4]}
                 signalState={lane.signal_state ?? (lane.is_green ? "green" : "red")}
                 queueLength={lane.queue_length ?? 0}
-                waitingTime={lane.waiting_time ?? 0}
+                countdown={lane.signal_countdown ?? 0}
               />
             );
           })}
@@ -551,7 +564,7 @@ export default function TrafficScene3D({ simData, error }) {
 
           {/* Render Cars */}
           {[0, 1, 2, 3].map((laneIdx) =>
-            Array.from({ length: 4 }).map((_, carIdx) => (
+            Array.from({ length: visibleCarCounts[laneIdx] }).map((_, carIdx) => (
               <Car
                 key={`${laneIdx}-${carIdx}`}
                 laneIdx={laneIdx}
@@ -562,7 +575,15 @@ export default function TrafficScene3D({ simData, error }) {
           )}
 
           {/* Physics loop wrapper */}
-          <PhysicsLoop lanes={lanes} carsRef={carsRef} carColors={carColors} />
+          <PhysicsLoop
+            lanes={lanes}
+            carsRef={carsRef}
+            carColors={carColors}
+            arrivalRates={arrivalRates}
+            spawnAccumulatorsRef={spawnAccumulatorsRef}
+            setVisibleCarCounts={setVisibleCarCounts}
+            onMeasuredCountsChange={onMeasuredCountsChange}
+          />
 
           <OrbitControls
             enablePan={true}
@@ -601,31 +622,58 @@ export default function TrafficScene3D({ simData, error }) {
 /* ------------------------------------------------------------------ */
 /* Dynamic Physics & Queueing Loop                                    */
 /* ------------------------------------------------------------------ */
-function PhysicsLoop({ lanes, carsRef, carColors }) {
-  useFrame(() => {
+function PhysicsLoop({
+  lanes,
+  carsRef,
+  carColors,
+  arrivalRates,
+  spawnAccumulatorsRef,
+  setVisibleCarCounts,
+  onMeasuredCountsChange,
+}) {
+  const reportTimerRef = useRef(0);
+
+  useFrame((_, delta) => {
     if (!carsRef.current) return;
+    const frameScale = Math.min(delta * 60, 1.5);
+    reportTimerRef.current += delta;
 
     for (let i = 0; i < 4; i++) {
-      const isGreen = (lanes[i]?.signal_state ?? (lanes[i]?.is_green ? "green" : "red")) === "green";
+      const signalState = lanes[i]?.signal_state ?? (lanes[i]?.is_green ? "green" : "red");
+      const isGreen = signalState === "green";
       const cars = carsRef.current[i];
+      const arrivalRate = Math.max(0, arrivalRates?.[i] ?? 0);
+
+      spawnAccumulatorsRef.current[i] += arrivalRate * delta;
+      while (spawnAccumulatorsRef.current[i] >= 1 && cars.length < 24) {
+        const minProgress = cars.length
+          ? Math.min(...cars.map((car) => car.progress))
+          : ROAD_SPAWN_PROGRESS + CAR_SPACING;
+        const nextProgress = Math.min(ROAD_SPAWN_PROGRESS, minProgress - CAR_SPACING);
+        cars.push(createSimCar(i, cars.length, carColors, nextProgress));
+        spawnAccumulatorsRef.current[i] -= 1;
+      }
+
+      if (cars.length >= 24) {
+        spawnAccumulatorsRef.current[i] = Math.min(spawnAccumulatorsRef.current[i], 1);
+      }
 
       // Update positions
       for (let j = 0; j < cars.length; j++) {
         const car = cars[j];
+        const isBeforeStopLine = car.progress < -2.0;
+        const isApproachingStopLine = car.progress > -6.0 && isBeforeStopLine;
+        const mustStopForSignal = !isGreen && isApproachingStopLine;
 
-        if (j === 0) {
-          // Lead car behavior
-          if (!isGreen && car.progress < -2.0 && car.progress > -6.0) {
-            // Decelerate smoothly to stop line
-            car.speed = Math.max(0, car.speed - 0.005);
-            if (car.progress > -2.15) {
-              car.progress = -2.0;
-              car.speed = 0;
-            }
-          } else {
-            // Accelerate towards maximum speed
-            car.speed = Math.min(car.maxSpeed, car.speed + 0.002);
+        if (mustStopForSignal) {
+          const stopTarget = j === 0 ? -2.0 : Math.min(-2.0, cars[j - 1].progress - 1.35);
+          car.speed = Math.max(0, car.speed - 0.004 * frameScale);
+          if (car.progress > stopTarget - 0.15) {
+            car.progress = stopTarget;
+            car.speed = 0;
           }
+        } else if (j === 0) {
+          car.speed = Math.min(car.maxSpeed, car.speed + 0.001 * frameScale);
         } else {
           // Follower car behavior (queueing)
           const carAhead = cars[j - 1];
@@ -634,33 +682,32 @@ function PhysicsLoop({ lanes, carsRef, carColors }) {
 
           if (spacing < safeSpacing) {
             // Decelerate to avoid collision
-            car.speed = Math.max(0, car.speed - 0.007);
+            car.speed = Math.max(0, car.speed - 0.004 * frameScale);
             if (spacing < 1.35) {
               car.progress = carAhead.progress - 1.35;
               car.speed = 0;
             }
           } else {
             // Accelerate towards maximum speed
-            car.speed = Math.min(car.maxSpeed, car.speed + 0.0025);
+            car.speed = Math.min(car.maxSpeed, car.speed + 0.0011 * frameScale);
           }
         }
 
         // Apply speed
-        car.progress += car.speed;
+        car.progress += car.speed * frameScale;
       }
 
-      // Check and recycle the lead car once it goes off-screen
-      if (cars[0].progress > 15.0) {
-        const lead = cars.shift();
-        const tail = cars[cars.length - 1];
-        // Reset behind the current tail car to avoid clipping/overlapping
-        lead.progress = Math.min(-15.0, tail.progress - 3.5);
-        lead.speed = 0;
-        lead.color = carColors[Math.floor(Math.random() * carColors.length)];
-        lead.maxSpeed = 0.07 + Math.random() * 0.04;
-        lead.route = chooseRandomTurn();
-        cars.push(lead);
+      // Check and recycle/remove the lead car only after it reaches the far road end.
+      if (cars[0]?.progress > ROAD_EXIT_PROGRESS) {
+        cars.shift();
       }
+    }
+
+    if (reportTimerRef.current >= 0.5) {
+      reportTimerRef.current = 0;
+      const counts = carsRef.current.map((cars) => cars.length);
+      setVisibleCarCounts(counts);
+      onMeasuredCountsChange?.(counts);
     }
   });
 
