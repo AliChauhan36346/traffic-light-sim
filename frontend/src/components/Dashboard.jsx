@@ -8,51 +8,72 @@ const LANE_COLORS = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b"];
 const STATUS_COLORS = { healthy: "#10b981", degraded: "#d97706", critical: "#ef4444" };
 const SIGNAL_COLORS = { green: "#10b981", yellow: "#facc15", red: "#ef4444" };
 
-function average(values) {
-  if (!values.length) return 0;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
+function createEmptyModeStats() {
+  return {
+    samples: 0,
+    waitTotal: 0,
+    queueTotal: 0,
+    vehiclesTotal: 0,
+  };
 }
 
-function getModeStats(history, mode) {
-  const samples = history.filter((entry) => entry.controller_mode === mode);
+function getModeStats(comparisonStats, mode) {
+  const stats = comparisonStats[mode] ?? createEmptyModeStats();
   return {
-    samples: samples.length,
-    avgWait: average(samples.map((entry) => Number(entry.avg_wait))).toFixed(1),
-    avgQueue: average(samples.map((entry) => Number(entry.total_queue))).toFixed(1),
-    avgVehicles: average(samples.map((entry) => Number(entry.total_vehicles))).toFixed(1),
+    samples: stats.samples,
+    avgWait: stats.samples ? (stats.waitTotal / stats.samples).toFixed(1) : "0.0",
+    avgQueue: stats.samples ? (stats.queueTotal / stats.samples).toFixed(1) : "0.0",
+    avgVehicles: stats.samples ? (stats.vehiclesTotal / stats.samples).toFixed(1) : "0.0",
   };
 }
 
 export default function Dashboard({ apiBase, health, sim, error }) {
   const [history, setHistory] = useState([]);
+  const [comparisonStats, setComparisonStats] = useState({
+    smart: createEmptyModeStats(),
+    fixed: createEmptyModeStats(),
+  });
 
   useEffect(() => {
     if (!sim) return;
 
+    const mode = sim.config?.controller_mode ?? sim.prediction?.controller ?? "smart";
+    const totalQueue = sim.lanes
+      ? sim.lanes.reduce((a, l) => a + l.queue_length, 0)
+      : 0;
+    const avgWaitSample = sim.lanes
+      ? sim.lanes.reduce((a, l) => a + l.waiting_time, 0) / Math.max(sim.lanes.length, 1)
+      : 0;
+    const totalVehiclesSample = sim.lanes
+      ? sim.lanes.reduce((a, l) => a + l.vehicle_count, 0)
+      : 0;
+
     setHistory((prev) => {
-      const totalQueue = sim.lanes
-        ? sim.lanes.reduce((a, l) => a + l.queue_length, 0)
-        : 0;
       const next = [
         ...prev,
         {
           time: new Date().toLocaleTimeString(),
-          controller_mode: sim.config?.controller_mode ?? sim.prediction?.controller ?? "smart",
+          controller_mode: mode,
           ...Object.fromEntries(
             (sim.lanes ?? []).map((l) => [`lane_${l.lane_id}_queue`, l.queue_length])
           ),
-          avg_wait: sim.lanes
-            ? (sim.lanes.reduce((a, l) => a + l.waiting_time, 0) /
-                Math.max(sim.lanes.length, 1)).toFixed(1)
-            : 0,
+          avg_wait: avgWaitSample.toFixed(1),
           total_queue: totalQueue.toFixed(1),
-          total_vehicles: sim.lanes
-            ? sim.lanes.reduce((a, l) => a + l.vehicle_count, 0)
-            : 0,
+          total_vehicles: totalVehiclesSample,
         },
       ];
       return next.slice(-120);
     });
+
+    setComparisonStats((prev) => ({
+      ...prev,
+      [mode]: {
+        samples: (prev[mode]?.samples ?? 0) + 1,
+        waitTotal: (prev[mode]?.waitTotal ?? 0) + avgWaitSample,
+        queueTotal: (prev[mode]?.queueTotal ?? 0) + totalQueue,
+        vehiclesTotal: (prev[mode]?.vehiclesTotal ?? 0) + totalVehiclesSample,
+      },
+    }));
   }, [sim]);
 
   // ---- Derived data ----
@@ -70,8 +91,8 @@ export default function Dashboard({ apiBase, health, sim, error }) {
     ? (lanes.reduce((a, l) => a + l.waiting_time, 0) / lanes.length).toFixed(1)
     : 0;
   const greenLanes = lanes.filter((l) => l.is_green).length;
-  const smartStats = getModeStats(history, "smart");
-  const fixedStats = getModeStats(history, "fixed");
+  const smartStats = getModeStats(comparisonStats, "smart");
+  const fixedStats = getModeStats(comparisonStats, "fixed");
   const activeMode = sim?.config?.controller_mode ?? "smart";
 
   const status = health?.model_loaded ? "healthy" : totalVehicles > 30 ? "critical" : "degraded";
@@ -275,7 +296,7 @@ function CompareCard({ title, active, stats }) {
         <span>Avg Queue: {stats.samples ? stats.avgQueue : "N/A"}</span>
         <span>Vehicles: {stats.samples ? stats.avgVehicles : "N/A"}</span>
       </div>
-      <div style={styles.compareSamples}>{stats.samples} samples</div>
+      <div style={styles.compareSamples}>{stats.samples} cumulative samples this session</div>
     </div>
   );
 }
